@@ -1,0 +1,366 @@
+// Star Catcher — a tiny browser game built from one prompt.
+// Built by an AI agent for make.fun's "The agent builds a game from one prompt" bounty.
+// SPDX-License-Identifier: MIT
+//
+// Run:  node main.ts
+// Then open out/game.html in any desktop browser. Arrow keys / A,D or the mouse
+// move the basket. Catch stars, dodge rocks, 60 seconds on the clock.
+
+import { writeFileSync, mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { join } from "node:path";
+
+export const PROMPT =
+  "Build a tiny browser game: Star Catcher. A basket slides along the bottom of " +
+  "a night sky, the player moves it with arrow keys or the mouse, golden stars fall " +
+  "and catching one scores 10 points, grey rocks fall too and hitting one costs a " +
+  "life, 3 lives, 60 seconds on the clock, falling speed rises as time runs out, " +
+  "and the game ends with a final score and press R to play again.";
+
+export const GAME_TITLE = "Star Catcher";
+
+const GAME_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Star Catcher — built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b1026; height: 100%; }
+  body { display: flex; align-items: center; justify-content: center; font-family: Arial, Helvetica, sans-serif; }
+  #wrap { text-align: center; }
+  canvas { background: #0b1026; border: 2px solid #2b3a6b; border-radius: 8px; display: block; }
+  #hint { color: #9fb0e0; font-size: 13px; margin-top: 8px; }
+  #hint b { color: #ffd75e; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div id="hint">Move with <b>Left / Right</b> or <b>A / D</b> or the mouse. Catch stars (+10), dodge rocks. 60 seconds, 3 lives. <b>R</b> restarts.</div>
+</div>
+<script>
+(function () {
+  var canvas = document.getElementById("game");
+  var ctx = canvas.getContext("2d");
+  var W = canvas.width, H = canvas.height;
+  var GROUND = H - 46;
+
+  // Seeded RNG so ?demo=1 plays the same game every time.
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var params = new URLSearchParams(location.search);
+  var DEMO = params.get("demo") === "1";
+  var rand = DEMO ? mulberry32(20261123) : Math.random;
+
+  var state = "ready"; // ready | playing | over
+  var score = 0, lives = 3, timeLeft = 60;
+  var basket = { x: W / 2 - 55, w: 110, h: 20, speed: 520 };
+  var items = [];
+  var sparks = [];
+  var popups = [];
+  var keys = {};
+  var mouseX = null;
+  var elapsed = 0, spawnIn = 0.6, lastTs = 0;
+  var bgStars = [];
+  for (var i = 0; i < 90; i++) {
+    bgStars.push({ x: rand() * W, y: rand() * (H - 120), r: 0.6 + rand() * 1.6, tw: rand() * 6.28 });
+  }
+
+  function reset() {
+    score = 0; lives = 3; timeLeft = 60;
+    items = []; sparks = []; popups = [];
+    basket.x = W / 2 - 55; elapsed = 0; spawnIn = 0.5;
+    state = "playing";
+  }
+
+  function spawn() {
+    var roll = rand();
+    var kind = roll < 0.68 ? "star" : (roll < 0.92 ? "rock" : "comet");
+    var speed = 150 + elapsed * 3.2 + rand() * 60;
+    if (kind === "comet") speed *= 1.5;
+    items.push({
+      kind: kind,
+      x: 30 + rand() * (W - 60),
+      y: -24,
+      vy: speed,
+      r: kind === "comet" ? 15 : (kind === "star" ? 13 : 16),
+      spin: rand() * 6.28,
+      vs: (rand() - 0.5) * 3
+    });
+  }
+
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      sparks.push({ x: x, y: y, vx: (rand() - 0.5) * 260, vy: -rand() * 180, life: 0.55, color: color });
+    }
+  }
+
+  function drawStar(x, y, r, color) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    for (var i = 0; i < 10; i++) {
+      var ang = -Math.PI / 2 + (i * Math.PI) / 5;
+      var rad = i % 2 === 0 ? r : r * 0.45;
+      var px = Math.cos(ang) * rad, py = Math.sin(ang) * rad;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawRock(x, y, r, spin) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(spin);
+    ctx.fillStyle = "#8a8f9e";
+    ctx.strokeStyle = "#5c6170";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-r, -r * 0.4); ctx.lineTo(-r * 0.3, -r); ctx.lineTo(r * 0.8, -r * 0.5);
+    ctx.lineTo(r, r * 0.5); ctx.lineTo(r * 0.2, r); ctx.lineTo(-r * 0.7, r * 0.6);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawBasket() {
+    var y = GROUND;
+    ctx.fillStyle = "#c98a3d";
+    ctx.beginPath();
+    ctx.moveTo(basket.x, y);
+    ctx.lineTo(basket.x + basket.w, y);
+    ctx.lineTo(basket.x + basket.w - 12, y + basket.h);
+    ctx.lineTo(basket.x + 12, y + basket.h);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = "#8a5a1d";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = "#ffd75e";
+    ctx.fillRect(basket.x + 8, y + 4, basket.w - 16, 3);
+  }
+
+  function drawBackground(t) {
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#0b1026");
+    g.addColorStop(0.7, "#18224d");
+    g.addColorStop(1, "#232a52");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#f4f1de";
+    ctx.beginPath();
+    ctx.arc(830, 74, 30, 0, 6.2832);
+    ctx.fill();
+    ctx.fillStyle = "#0b1026";
+    ctx.beginPath();
+    ctx.arc(818, 66, 26, 0, 6.2832);
+    ctx.fill();
+    for (var i = 0; i < bgStars.length; i++) {
+      var s = bgStars[i];
+      ctx.globalAlpha = 0.35 + 0.65 * Math.abs(Math.sin(t / 900 + s.tw));
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#101736";
+    ctx.fillRect(0, GROUND + basket.h, W, H - GROUND - basket.h);
+    ctx.fillStyle = "#2b3a6b";
+    ctx.fillRect(0, GROUND + basket.h, W, 2);
+  }
+
+  function drawHud() {
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 22px Arial";
+    ctx.textAlign = "left";
+    ctx.fillText("SCORE  " + score, 18, 34);
+    ctx.textAlign = "center";
+    ctx.fillText("TIME  " + Math.ceil(timeLeft) + "s", W / 2, 34);
+    ctx.textAlign = "right";
+    ctx.fillText("LIVES  " + lives, W - 18, 34);
+    ctx.textAlign = "left";
+  }
+
+  function drawOverlay() {
+    ctx.fillStyle = "rgba(8, 10, 28, 0.72)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#ffd75e";
+    ctx.font = "bold 54px Arial";
+    ctx.textAlign = "center";
+    if (state === "ready") {
+      ctx.fillText("STAR CATCHER", W / 2, H / 2 - 46);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "22px Arial";
+      ctx.fillText("Catch the falling stars. Dodge the rocks.", W / 2, H / 2 + 4);
+      ctx.fillText("60 seconds, 3 lives. Press SPACE or click to play.", W / 2, H / 2 + 40);
+      ctx.fillStyle = "#9fb0e0";
+      ctx.font = "15px Arial";
+      ctx.fillText("Built from one prompt by an AI agent.", W / 2, H / 2 + 84);
+    } else {
+      ctx.fillText("TIME UP!", W / 2, H / 2 - 46);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 30px Arial";
+      ctx.fillText("Final score: " + score, W / 2, H / 2 + 8);
+      ctx.font = "22px Arial";
+      ctx.fillText("Press R to play again.", W / 2, H / 2 + 52);
+    }
+    ctx.textAlign = "left";
+  }
+
+  function update(dt) {
+    if (state !== "playing") return;
+    elapsed += dt;
+    timeLeft -= dt;
+    if (timeLeft <= 0) { timeLeft = 0; state = "over"; return; }
+    if (keys["ArrowLeft"] || keys["a"] || keys["A"]) basket.x -= basket.speed * dt;
+    if (keys["ArrowRight"] || keys["d"] || keys["D"]) basket.x += basket.speed * dt;
+    if (mouseX !== null) basket.x += (mouseX - basket.w / 2 - basket.x) * Math.min(1, dt * 14);
+    if (DEMO) {
+      var target = null;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].kind === "star" && (target === null || items[i].y > target.y)) target = items[i];
+      }
+      if (target) basket.x += (target.x - basket.w / 2 - basket.x) * Math.min(1, dt * 10);
+    }
+    if (basket.x < 0) basket.x = 0;
+    if (basket.x > W - basket.w) basket.x = W - basket.w;
+    spawnIn -= dt;
+    if (spawnIn <= 0) { spawn(); spawnIn = Math.max(0.28, 0.85 - elapsed * 0.008); }
+    var by = GROUND + basket.h / 2;
+    for (var j = items.length - 1; j >= 0; j--) {
+      var it = items[j];
+      it.y += it.vy * dt;
+      it.spin += it.vs * dt;
+      var cx = basket.x + basket.w / 2;
+      if (it.y + it.r >= GROUND && it.y - it.r <= GROUND + basket.h &&
+          Math.abs(it.x - cx) < basket.w / 2 + it.r * 0.6) {
+        if (it.kind === "star") {
+          score += 10;
+          burst(it.x, it.y, "#ffd75e", 12);
+          popups.push({ x: it.x, y: it.y, text: "+10", life: 0.8 });
+        } else if (it.kind === "comet") {
+          score += 25;
+          burst(it.x, it.y, "#7ee0ff", 18);
+          popups.push({ x: it.x, y: it.y, text: "+25", life: 0.8 });
+        } else {
+          lives -= 1;
+          burst(it.x, it.y, "#ff5d5d", 14);
+          popups.push({ x: it.x, y: it.y, text: "OUCH", life: 0.8 });
+          if (lives <= 0) { state = "over"; }
+        }
+        items.splice(j, 1);
+        continue;
+      }
+      if (it.y - it.r > H) items.splice(j, 1);
+    }
+    for (var k = sparks.length - 1; k >= 0; k--) {
+      var sp = sparks[k];
+      sp.x += sp.vx * dt; sp.y += sp.vy * dt; sp.vy += 320 * dt; sp.life -= dt;
+      if (sp.life <= 0) sparks.splice(k, 1);
+    }
+    for (var m = popups.length - 1; m >= 0; m--) {
+      popups[m].y -= 40 * dt; popups[m].life -= dt;
+      if (popups[m].life <= 0) popups.splice(m, 1);
+    }
+  }
+
+  function render(t) {
+    drawBackground(t);
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it.kind === "star") drawStar(it.x, it.y, it.r, "#ffd75e");
+      else if (it.kind === "comet") drawStar(it.x, it.y, it.r, "#7ee0ff");
+      else drawRock(it.x, it.y, it.r, it.spin);
+    }
+    drawBasket();
+    for (var j = 0; j < sparks.length; j++) {
+      var sp = sparks[j];
+      ctx.globalAlpha = Math.max(0, sp.life / 0.55);
+      ctx.fillStyle = sp.color;
+      ctx.fillRect(sp.x - 2, sp.y - 2, 4, 4);
+    }
+    ctx.globalAlpha = 1;
+    ctx.font = "bold 20px Arial";
+    ctx.textAlign = "center";
+    for (var k = 0; k < popups.length; k++) {
+      var p = popups[k];
+      ctx.globalAlpha = Math.max(0, p.life / 0.8);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(p.text, p.x, p.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.textAlign = "left";
+    drawHud();
+    if (state !== "playing") drawOverlay();
+  }
+
+  function frame(ts) {
+    var dt = lastTs ? Math.min(0.05, (ts - lastTs) / 1000) : 0.016;
+    lastTs = ts;
+    update(dt);
+    render(ts);
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener("keydown", function (e) {
+    keys[e.key] = true;
+    if (e.key === " " && state === "ready") { reset(); e.preventDefault(); }
+    if ((e.key === "r" || e.key === "R") && state === "over") reset();
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight") e.preventDefault();
+  });
+  window.addEventListener("keyup", function (e) { keys[e.key] = false; });
+  canvas.addEventListener("mousemove", function (e) {
+    var rect = canvas.getBoundingClientRect();
+    mouseX = ((e.clientX - rect.left) / rect.width) * W;
+  });
+  canvas.addEventListener("click", function () {
+    if (state === "ready") reset();
+    else if (state === "over") reset();
+  });
+  if (DEMO) reset();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+`;
+
+function sha256(text) {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+function main() {
+  const outDir = join(process.cwd(), "out");
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(join(outDir, "game.html"), GAME_HTML, "utf8");
+  const build = {
+    prompt: PROMPT,
+    title: GAME_TITLE,
+    game_sha256: sha256(GAME_HTML),
+    game_lines: GAME_HTML.split("\n").length,
+    game_bytes: Buffer.byteLength(GAME_HTML, "utf8"),
+    demo_seed: 20261123,
+    controls: "Arrow keys / A,D or mouse; R restarts",
+    files: ["game.html", "build.json"],
+  };
+  writeFileSync(join(outDir, "build.json"), JSON.stringify(build, null, 2) + "\n", "utf8");
+  console.log("Star Catcher built from one prompt.");
+  console.log("game: out/game.html (" + build.game_bytes + " bytes, " + build.game_lines + " lines)");
+  console.log("sha256: " + build.game_sha256);
+  console.log("open out/game.html in a browser to play.");
+  console.log("controls: arrow keys / A,D or mouse to move, R restarts, ?demo=1 auto-plays.");
+}
+
+main();
