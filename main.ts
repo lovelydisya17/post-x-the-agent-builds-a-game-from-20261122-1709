@@ -2,13 +2,24 @@
 // Built by an AI agent for make.fun's "The agent builds a game from one prompt" bounty.
 // SPDX-License-Identifier: MIT
 //
-// Run:  node main.ts
+// The entry is the post itself: a short video on X of this agent building the game
+// from one prompt, ending with make.fun's referral end card. This program copies
+// POST.json (the post's address) from the repository root to the output directory,
+// where the gate reads it, and builds the game from the one prompt into the same
+// output directory. Node 22, standard library only, no network, no wall clock,
+// deterministic: two runs write the same bytes.
+//
+// Run the way the grader does:
+//   mkdir -p out && MAKEFUN_BOT_DIR=. MAKEFUN_OUTPUT_DIR=out node main.ts
 // Then open out/game.html in any desktop browser. Arrow keys / A,D or the mouse
 // move the basket. Catch stars, dodge rocks, 60 seconds on the clock.
 
-import { writeFileSync, mkdirSync } from "node:fs";
+import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+
+const BOT_DIR = process.env.MAKEFUN_BOT_DIR ?? "/bot";
+const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
 
 export const PROMPT =
   "Build a tiny browser game: Star Catcher. A basket slides along the bottom of " +
@@ -342,9 +353,14 @@ function sha256(text) {
 }
 
 function main() {
-  const outDir = join(process.cwd(), "out");
-  mkdirSync(outDir, { recursive: true });
-  writeFileSync(join(outDir, "game.html"), GAME_HTML, "utf8");
+  mkdirSync(OUTPUT_DIR, { recursive: true });
+  try {
+    copyFileSync(join(BOT_DIR, "POST.json"), join(OUTPUT_DIR, "POST.json"));
+  } catch (err) {
+    console.error("POST.json could not be copied from " + BOT_DIR + ": " + err.message);
+    process.exit(1);
+  }
+  writeFileSync(join(OUTPUT_DIR, "game.html"), GAME_HTML, "utf8");
   const build = {
     prompt: PROMPT,
     title: GAME_TITLE,
@@ -353,14 +369,13 @@ function main() {
     game_bytes: Buffer.byteLength(GAME_HTML, "utf8"),
     demo_seed: 20261123,
     controls: "Arrow keys / A,D or mouse; R restarts",
-    files: ["game.html", "build.json"],
+    files: ["game.html", "build.json", "POST.json"],
   };
-  writeFileSync(join(outDir, "build.json"), JSON.stringify(build, null, 2) + "\n", "utf8");
+  writeFileSync(join(OUTPUT_DIR, "build.json"), JSON.stringify(build, null, 2) + "\n", "utf8");
   console.log("Star Catcher built from one prompt.");
-  console.log("game: out/game.html (" + build.game_bytes + " bytes, " + build.game_lines + " lines)");
+  console.log("game: " + join(OUTPUT_DIR, "game.html") + " (" + build.game_bytes + " bytes, " + build.game_lines + " lines)");
   console.log("sha256: " + build.game_sha256);
-  console.log("open out/game.html in a browser to play.");
-  console.log("controls: arrow keys / A,D or mouse to move, R restarts, ?demo=1 auto-plays.");
+  console.log("post: " + join(OUTPUT_DIR, "POST.json"));
 }
 
 main();
